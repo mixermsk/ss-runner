@@ -9,54 +9,84 @@ import tempfile
 import threading
 import yaml
 
-
 def parse_config(path):
-    cp = open(path)
-    conf = yaml.load(cp)
+    with open(path) as cp:
+        conf = yaml.safe_load(cp)
 
-    required_fields = {'users', 'cert', 'key'}
+    required_fields = { 'users', 'cert', 'key' }
     missing_fields = required_fields - set(conf.keys())
 
     if missing_fields:
         raise RuntimeError('Missed params in config file: {}'.format(missing_fields))
 
-    user_req_fields = {'port', 'password', 'method'}
+    user_req_fields = { 'port', 'password', 'method' }
     for user in conf['users']:
-        if 'host' not in user:
-            user['host'] = 'localhost'
-
         missing_fields = user_req_fields - set(user.keys())
         if missing_fields:
-            raise RuntimeError('Missed params in users section of config file: {}'.format(missing_fields))
-
+            raise RuntimeError('Missed params in users section of config file: {}'.format(missing_fields)) 
     return conf
 
 
 def gen_sslh_conf(path):
     protos = []
-    for user_conf in config['users'] + config.get('sslh-protos', []):
-        if 'tls' not in user_conf:
+    for conf in config.get('users', []) + config.get('services', []):
+        if 'tls' not in conf:
             continue
 
-        protos.append('''
+        protos.append(f'''
     {{
         name: "tls";
-        host: "{}";
-        port: "{}";
-        sni_hostnames: [ "{}" ];
-    }}'''.format(user_conf['host'], user_conf['port'], user_conf['tls-host']))
+        host: "{ conf['host'] if 'host' in conf else '127.0.0.1' }";
+        port: "{ conf['port'] }";
+        sni_hostnames: [ "{ conf['sni'] }" ];
+    }}''')
 
-    conf = '''
+    res = '''
 protocols: (
   {}
 );'''.format(','.join(protos))
-    with open(path, 'w+') as cp:
-        cp.write(conf)
 
+    with open(path, 'w+') as cp:
+        cp.write(res)
+
+def gen_haproxy_conf(path):
+    res = ''
+    back_names = []
+    for conf in config.get('users', []) + config.get('services', []):
+        back_names.append(conf['sni'])
+
+        res += f'''
+backend { conf['sni'] }
+    mode tcp
+    option tcp-check
+    server name { conf['host'] if 'host' in conf else '127.0.0.1'}:{conf['port']} check
+'''
+
+    res += '''
+
+frontend tls_in
+    bind *:443
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+'''
+    for name in back_names:
+        if name == 'default':
+            continue
+
+        res += f'''
+    use_backend { name } if {{ req.ssl_sni -i { name } }}'''
+        
+    if 'default' in back_names:
+        res+= '''
+    default_backend default
+'''
+    with open(path, 'w+') as cp:
+        cp.write(res)
 
 def gen_ss_conf(params, path):
     user_conf = {
-            "server": params['host'],
+            "server": params['host'] if 'host' in params else '127.0.0.1',
             "server_port": params['port'],
             "password": params['password'],
             "method": params['method'],
@@ -66,7 +96,7 @@ def gen_ss_conf(params, path):
         global config
         user_conf.update({
             "plugin": "v2ray-plugin",
-            "plugin_opts": "server;tls;host={};cert={};key={}".format(params['tls-host'], config['cert'], config['key'])
+            "plugin_opts": f"server;tls;host={ params['sni'] };cert={ config['cert'] };key={ config['key'] }"
         })
 
     with open(path, 'w+') as cp:
@@ -79,18 +109,13 @@ def run_ss(conf_path):
     cmd = 'ss-server -c {}'.format(conf_path)
 
     logging.info('Starting new ss-server: {}'.format(cmd))
-    subprocess.check_output(cmd.split())
-
-
-def run_sslh(conf):
-    cmd = 'sudo sslh -f --user sslh --listen 0.0.0.0:443 -F {}'.format(conf)
-    logging.info('Starting sslh: {}'.format(cmd))
-    subprocess.check_output(cmd.split())
-
+    subprocess.run(cmd.split())
 
 if __name__ == "__main__":
     cmdparser = argparse.ArgumentParser()
     cmdparser.add_argument("--config", "-c", type=str, required=True, help="Config path")
+    cmdparser.add_argument("--sslh", "-S", type=str, dest="sslh_conf", help="Path to SSLH config")
+    cmdparser.add_argument("--haproxy", "-H", type=str, dest="haproxy_conf", help="Path to HaProxy config")
     cmdparser.add_argument("--debug", "-D", action="store_true", help="debug")
     cmdargs = cmdparser.parse_args()
 
@@ -101,15 +126,15 @@ if __name__ == "__main__":
     tmp_dir = tempfile.mkdtemp(prefix="ss-runner-")
     logging.info('Creating temporary directory {}'.format(tmp_dir))
 
-    sslh_conf = os.path.join(tmp_dir, 'sslh.conf')
-    gen_sslh_conf(sslh_conf)
+    if cmdargs.sslh_conf:
+        gen_sslh_conf(cmdargs.sslh_conf)
+    elif cmdargs.haproxy_conf:
+        gen_haproxy_conf(cmdargs.haproxy_conf)
 
     threads = []
-    threads.append(threading.Thread(name="sslh", target=run_sslh, args=(sslh_conf,)))
-
     for user_conf in config['users']:
         conf_path = os.path.join(tmp_dir, '{}.conf'.format(user_conf['port']))
         gen_ss_conf(user_conf, conf_path)
         threads.append(threading.Thread(name="ss_{}".format(user_conf['port']), target=run_ss, args=(conf_path,)))
 
-    [thr.start() for thr in threads]
+    [ thr.start() for thr in threads ]
