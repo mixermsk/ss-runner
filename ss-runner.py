@@ -86,7 +86,7 @@ frontend tls_in
 
 def gen_ss_conf(params, path):
     user_conf = {
-            "server": params['host'],
+            "server": params['host'] if 'host' in params else '127.0.0.1',
             "server_port": params['port'],
             "password": params['password'],
             "method": params['method'],
@@ -96,7 +96,7 @@ def gen_ss_conf(params, path):
         global config
         user_conf.update({
             "plugin": "v2ray-plugin",
-            "plugin_opts": "server;tls;host={};cert={};key={}".format(params['sni'], config['cert'], config['key'])
+            "plugin_opts": f"server;tls;host={ params['sni'] };cert={ config['cert'] };key={ config['key'] }"
         })
 
     with open(path, 'w+') as cp:
@@ -109,7 +109,7 @@ def run_ss(conf_path):
     cmd = 'ss-server -c {}'.format(conf_path)
 
     logging.info('Starting new ss-server: {}'.format(cmd))
-    subprocess.check_output(cmd.split())
+    subprocess.run(cmd.split())
 
 if __name__ == "__main__":
     cmdparser = argparse.ArgumentParser()
